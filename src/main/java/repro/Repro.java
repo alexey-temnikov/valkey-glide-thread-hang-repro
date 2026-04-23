@@ -15,6 +15,7 @@ import glide.api.models.configuration.NodeAddress;
 import glide.api.models.configuration.PeriodicChecksManualInterval;
 import glide.api.models.configuration.ReadFrom;
 import io.lettuce.core.RedisURI;
+import io.lettuce.core.TimeoutOptions;
 import io.lettuce.core.cluster.ClusterClientOptions;
 import io.lettuce.core.cluster.ClusterTopologyRefreshOptions;
 import io.lettuce.core.cluster.RedisClusterClient;
@@ -48,13 +49,20 @@ public class Repro {
     if (client == null) throw new IllegalStateException("cannot connect to " + host + ":" + port);
     final Client c = client;
 
-    // idle Lettuce holds direct-memory buffers — simulates a co-located fallback client.
-    // (When CLIENT=lettuce this is a second, always-idle Lettuce client — still the same parity role.)
-    RedisClusterClient lettuceIdle = RedisClusterClient.create("redis://" + host + ":" + port);
-    try { lettuceIdle.connect().sync().ping(); } catch (Exception ignore) {}
+    // idle Lettuce parity client — only needed when the main client is GLIDE (holds
+    // direct-memory Netty buffers for off-heap parity). Skipped when CLIENT=lettuce
+    // because the main Lettuce client already provides the same footprint and a
+    // second default-configured client would block on handshake.
+    if ("glide".equals(which)) {
+      RedisClusterClient lettuceIdle = RedisClusterClient.create("redis://" + host + ":" + port);
+      try { lettuceIdle.connect().sync().ping(); } catch (Exception ignore) {}
+      System.out.println("[INIT] idle Lettuce parity client connected");
+    }
 
     // pre-populate keys so reads have data
+    System.out.println("[INIT] pre-populating 1000 keys...");
     for (int i = 0; i < 1000; i++) c.set("k:" + i, "v");
+    System.out.println("[INIT] pre-population complete");
 
     AtomicInteger tid = new AtomicInteger();
     ForkJoinPool dispatcher = new ForkJoinPool(50,
@@ -88,7 +96,7 @@ public class Repro {
   }
 
   static Client newLettuce(String host, int port) {
-    // connection-level timeout (1 s, matches GLIDE connectionTimeout)
+    // default 1 s timeout for connect + commands
     RedisURI uri = RedisURI.Builder.redis(host, port).withTimeout(Duration.ofSeconds(1)).build();
     RedisClusterClient raw = RedisClusterClient.create(uri);
     raw.setOptions(ClusterClientOptions.builder()
@@ -96,14 +104,15 @@ public class Repro {
             .enablePeriodicRefresh(Duration.ofSeconds(60))
             .enableAllAdaptiveRefreshTriggers()
             .build())
+        // apply the URI timeout to every command (not just sync)
+        .timeoutOptions(TimeoutOptions.enabled(Duration.ofMillis(500)))
         .build());
     StatefulRedisClusterConnection<String, String> conn = raw.connect();
     conn.setReadFrom(io.lettuce.core.ReadFrom.ANY);
-    // per-command timeout. 500 ms is deliberately generous so cluster slot-map warmup
-    // and MOVED redirects don't cause every command to time out at 30 ms. The parity
-    // point we care about is behavioural: does the client + managedBlock explode
-    // under concurrent blocking future.get()? not: can it match a 30 ms SLA.
-    conn.setTimeout(Duration.ofMillis(500));
+    // force a topology refresh so the partition table is populated after the cluster
+    // finished assigning slots (addslots is run AFTER valkey-server boot in compose)
+    raw.refreshPartitions();
+    System.out.println("[INIT] Lettuce partitions: " + raw.getPartitions());
     RedisAdvancedClusterAsyncCommands<String, String> cmd = conn.async();
     return new Client() {
       public String get(String k) throws Exception { return cmd.get(k).toCompletableFuture().get(); }
