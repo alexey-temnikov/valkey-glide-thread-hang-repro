@@ -41,6 +41,12 @@ public class Repro {
     String which = System.getenv().getOrDefault("CLIENT", "glide").toLowerCase();
     System.out.printf("[INIT] client=%s host=%s port=%d%n", which, host, port);
 
+    // Enable Lettuce DEBUG logging when CLIENT=lettuce so we can see command flow
+    if ("lettuce".equals(which)) {
+      System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", "info");
+      System.setProperty("org.slf4j.simpleLogger.log.io.lettuce.core.protocol", "debug");
+    }
+
     Client client = null;
     for (int attempt = 1; attempt <= 30 && client == null; attempt++) {
       try { client = "lettuce".equals(which) ? newLettuce(host, port) : newGlide(host, port); }
@@ -63,6 +69,25 @@ public class Repro {
     System.out.println("[INIT] pre-populating 1000 keys...");
     for (int i = 0; i < 1000; i++) c.set("k:" + i, "v");
     System.out.println("[INIT] pre-population complete");
+
+    // SANITY: fire 50 concurrent GETs from plain Threads (no ForkJoinPool), wait for them.
+    // If this hangs, the problem is in the Lettuce client itself (or my use of it),
+    // NOT in managedBlock / ForkJoinPool.
+    System.out.println("[INIT] concurrent sanity: 50 parallel GETs...");
+    java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(50);
+    java.util.concurrent.atomic.AtomicInteger ok = new java.util.concurrent.atomic.AtomicInteger();
+    java.util.concurrent.atomic.AtomicInteger fail = new java.util.concurrent.atomic.AtomicInteger();
+    for (int i = 0; i < 50; i++) {
+      final int kk = i;
+      new Thread(() -> {
+        try { c.get("k:" + kk); ok.incrementAndGet(); }
+        catch (Exception e) { fail.incrementAndGet(); }
+        finally { latch.countDown(); }
+      }, "sanity-" + i).start();
+    }
+    boolean completed = latch.await(15, java.util.concurrent.TimeUnit.SECONDS);
+    System.out.printf("[INIT] sanity result: completed=%s ok=%d fail=%d (remaining=%d)%n",
+        completed, ok.get(), fail.get(), latch.getCount());
 
     AtomicInteger tid = new AtomicInteger();
     ForkJoinPool dispatcher = new ForkJoinPool(50,
