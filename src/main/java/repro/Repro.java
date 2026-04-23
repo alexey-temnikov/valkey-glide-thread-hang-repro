@@ -88,7 +88,8 @@ public class Repro {
   }
 
   static Client newLettuce(String host, int port) {
-    RedisURI uri = RedisURI.Builder.redis(host, port).withTimeout(Duration.ofMillis(30)).build();
+    // connection-level timeout (1 s, matches GLIDE connectionTimeout)
+    RedisURI uri = RedisURI.Builder.redis(host, port).withTimeout(Duration.ofSeconds(1)).build();
     RedisClusterClient raw = RedisClusterClient.create(uri);
     raw.setOptions(ClusterClientOptions.builder()
         .topologyRefreshOptions(ClusterTopologyRefreshOptions.builder()
@@ -98,6 +99,8 @@ public class Repro {
         .build());
     StatefulRedisClusterConnection<String, String> conn = raw.connect();
     conn.setReadFrom(io.lettuce.core.ReadFrom.ANY);
+    // per-command timeout (30 ms, matches GLIDE requestTimeout)
+    conn.setTimeout(Duration.ofMillis(30));
     RedisAdvancedClusterAsyncCommands<String, String> cmd = conn.async();
     return new Client() {
       public String get(String k) throws Exception { return cmd.get(k).toCompletableFuture().get(); }
