@@ -21,11 +21,34 @@ repro-docker/
 
 ```bash
 cd repro-docker
-docker compose up --build
+docker compose up --build              # default — runs GLIDE client
+docker compose --profile lettuce up --build app-lettuce valkey   # Lettuce equivalent
 ```
+
+Both services use the exact same harness (same `ForkJoinPool.managedBlock`, same blocking
+`future.get()`, same 500 req/s pacing, same 1–16 GET fan-out) — only the underlying
+client implementation differs. The goal is to A/B compare the two under identical load
+and memory pressure.
+
+Selector is controlled by the `CLIENT` environment variable (`glide` or `lettuce`).
 
 On Apple Silicon / ARM hosts the images build for `linux/amd64` (required — GLIDE only
 publishes `linux-x86_64` native artefacts).
+
+### GLIDE vs Lettuce — what differs
+
+Both services run an identical workload. Expected observations:
+
+- **GLIDE (`app`)** — thread pool grows unbounded, `[STUCK]` tag fires within minutes,
+  `avg` latency drifts past the configured 30 ms timeout into the thousands of ms. The
+  `CompletableFuture` is never completed by the native callback.
+- **Lettuce (`app-lettuce`)** — on the same hardware and memory budget the workload
+  should either sustain throughput or fail fast with `RedisCommandTimeoutException` at
+  ~30 ms. Thread pool should stay near 50.
+
+Running both gives a controlled before/after demonstrating that the hang is specific to
+the GLIDE JNI callback path, not to the general "500 req/s with blocking `get()`"
+pattern.
 
 ## Expected output
 

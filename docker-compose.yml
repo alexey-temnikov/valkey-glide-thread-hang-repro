@@ -12,13 +12,32 @@ services:
         tail -f /dev/null
     ports: ["6379:6379", "16379:16379"]
 
+  # Default — reproduces the GLIDE thread-hang.
+  # Run with:   docker compose up --build app
   app:
     build: .
     platform: linux/amd64
     depends_on: [valkey]
     command: ["valkey", "6379"]
     environment:
+      CLIENT: glide
       GLIDE_LOG_LEVEL: WARN
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1400m
+
+  # Lettuce equivalent — same harness, same managedBlock + future.get(), Lettuce client.
+  # Run with:   docker compose up --build app-lettuce
+  app-lettuce:
+    build: .
+    platform: linux/amd64
+    depends_on: [valkey]
+    command: ["valkey", "6379"]
+    environment:
+      CLIENT: lettuce
+    profiles: ["lettuce"]
     deploy:
       resources:
         limits:

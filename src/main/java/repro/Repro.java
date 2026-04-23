@@ -1,5 +1,6 @@
 package repro;
 
+import java.time.Duration;
 import java.util.Random;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinWorkerThread;
@@ -13,10 +14,17 @@ import glide.api.models.configuration.GlideClusterClientConfiguration;
 import glide.api.models.configuration.NodeAddress;
 import glide.api.models.configuration.PeriodicChecksManualInterval;
 import glide.api.models.configuration.ReadFrom;
+import io.lettuce.core.RedisURI;
+import io.lettuce.core.cluster.ClusterClientOptions;
+import io.lettuce.core.cluster.ClusterTopologyRefreshOptions;
 import io.lettuce.core.cluster.RedisClusterClient;
+import io.lettuce.core.cluster.api.StatefulRedisClusterConnection;
+import io.lettuce.core.cluster.api.async.RedisAdvancedClusterAsyncCommands;
 
-/** Minimal reproduction of a GLIDE thread-hang. No network manipulation; relies on
- *  off-heap memory squeeze + concurrent load + ForkJoinPool.managedBlock + future.get(). */
+/** Minimal reproduction of a client-future thread-hang. Two client implementations are
+ *  selectable via env var {@code CLIENT}: {@code glide} (default) or {@code lettuce}.
+ *  The rest of the harness — ForkJoinPool.managedBlock + future.get() + 500 req/s —
+ *  is identical. */
 public class Repro {
   static final AtomicLong totalGets = new AtomicLong();
   static final AtomicLong totalErrs = new AtomicLong();
@@ -24,36 +32,29 @@ public class Repro {
   static final AtomicLong latencySumNs = new AtomicLong();
   static final AtomicLong latencySamples = new AtomicLong();
 
+  /** Minimal shim so the request loop doesn't care which client is behind it. */
+  interface Client { String get(String key) throws Exception; void set(String key, String value) throws Exception; }
+
   public static void main(String[] args) throws Exception {
     String host = args[0]; int port = Integer.parseInt(args[1]);
+    String which = System.getenv().getOrDefault("CLIENT", "glide").toLowerCase();
+    System.out.printf("[INIT] client=%s host=%s port=%d%n", which, host, port);
 
-    GlideClusterClient client = null;
+    Client client = null;
     for (int attempt = 1; attempt <= 30 && client == null; attempt++) {
-      try {
-        client = GlideClusterClient.createClient(
-            GlideClusterClientConfiguration.builder()
-              .address(NodeAddress.builder().host(host).port(port).build())
-              .requestTimeout(30)
-              .readFrom(ReadFrom.AZ_AFFINITY_REPLICAS_AND_PRIMARY)
-              .advancedConfiguration(AdvancedGlideClusterClientConfiguration.builder()
-                .connectionTimeout(1000)
-                .periodicChecks(PeriodicChecksManualInterval.builder().durationInSec(60).build())
-                .build())
-              .build()).get();
-      } catch (Exception e) {
-        System.out.println("waiting for valkey cluster... attempt " + attempt);
-        Thread.sleep(2000);
-      }
+      try { client = "lettuce".equals(which) ? newLettuce(host, port) : newGlide(host, port); }
+      catch (Exception e) { System.out.println("waiting for valkey cluster... attempt " + attempt); Thread.sleep(2000); }
     }
     if (client == null) throw new IllegalStateException("cannot connect to " + host + ":" + port);
-    final GlideClusterClient c = client;
+    final Client c = client;
 
     // idle Lettuce holds direct-memory buffers — simulates a co-located fallback client.
+    // (When CLIENT=lettuce this is a second, always-idle Lettuce client — still the same parity role.)
     RedisClusterClient lettuceIdle = RedisClusterClient.create("redis://" + host + ":" + port);
     try { lettuceIdle.connect().sync().ping(); } catch (Exception ignore) {}
 
     // pre-populate keys so reads have data
-    for (int i = 0; i < 1000; i++) c.set("k:" + i, "v").get();
+    for (int i = 0; i < 1000; i++) c.set("k:" + i, "v");
 
     AtomicInteger tid = new AtomicInteger();
     ForkJoinPool dispatcher = new ForkJoinPool(50,
@@ -67,12 +68,51 @@ public class Repro {
     Thread.sleep(Long.MAX_VALUE);
   }
 
-  static void requestLoop(ForkJoinPool pool, GlideClusterClient c) {
+  // ───────── client constructors ─────────
+
+  static Client newGlide(String host, int port) throws Exception {
+    GlideClusterClient g = GlideClusterClient.createClient(
+        GlideClusterClientConfiguration.builder()
+          .address(NodeAddress.builder().host(host).port(port).build())
+          .requestTimeout(30)
+          .readFrom(ReadFrom.AZ_AFFINITY_REPLICAS_AND_PRIMARY)
+          .advancedConfiguration(AdvancedGlideClusterClientConfiguration.builder()
+            .connectionTimeout(1000)
+            .periodicChecks(PeriodicChecksManualInterval.builder().durationInSec(60).build())
+            .build())
+          .build()).get();
+    return new Client() {
+      public String get(String k) throws Exception { return g.get(k).get(); }
+      public void set(String k, String v) throws Exception { g.set(k, v).get(); }
+    };
+  }
+
+  static Client newLettuce(String host, int port) {
+    RedisURI uri = RedisURI.Builder.redis(host, port).withTimeout(Duration.ofMillis(30)).build();
+    RedisClusterClient raw = RedisClusterClient.create(uri);
+    raw.setOptions(ClusterClientOptions.builder()
+        .topologyRefreshOptions(ClusterTopologyRefreshOptions.builder()
+            .enablePeriodicRefresh(Duration.ofSeconds(60))
+            .enableAllAdaptiveRefreshTriggers()
+            .build())
+        .build());
+    StatefulRedisClusterConnection<String, String> conn = raw.connect();
+    conn.setReadFrom(io.lettuce.core.ReadFrom.ANY);
+    RedisAdvancedClusterAsyncCommands<String, String> cmd = conn.async();
+    return new Client() {
+      public String get(String k) throws Exception { return cmd.get(k).toCompletableFuture().get(); }
+      public void set(String k, String v) throws Exception { cmd.set(k, v).toCompletableFuture().get(); }
+    };
+  }
+
+  // ───────── request + monitor loops (identical for both clients) ─────────
+
+  static void requestLoop(ForkJoinPool pool, Client c) {
     Random rng = new Random();
-     /**
-     *   - 1 second = 1,000,000,000 ns                                                                                                                                                       
-     *   - 2,000,000 ns = 2 ms                                                                                                                                                               
-     *   - 1,000,000,000 / 2,000,000 = 500 requests per second 
+    /**
+     *   - 1 second = 1,000,000,000 ns
+     *   - 2,000,000 ns = 2 ms
+     *   - 1,000,000,000 / 2,000,000 = 500 requests per second
      **/
     final long nsPerRequest = 10_000_000L; // 100 req/s
 
@@ -90,7 +130,7 @@ public class Repro {
                 blocking.incrementAndGet();
                 long t0 = System.nanoTime();
                 try {
-                  c.get("k:" + k).get();   // blocking future.get() — no timeout
+                  c.get("k:" + k);   // blocking future.get() inside the client shim
                   long dt = System.nanoTime() - t0;
                   latencySumNs.addAndGet(dt); latencySamples.incrementAndGet();
                   totalGets.incrementAndGet();
