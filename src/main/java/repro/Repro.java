@@ -99,8 +99,11 @@ public class Repro {
         .build());
     StatefulRedisClusterConnection<String, String> conn = raw.connect();
     conn.setReadFrom(io.lettuce.core.ReadFrom.ANY);
-    // per-command timeout (30 ms, matches GLIDE requestTimeout)
-    conn.setTimeout(Duration.ofMillis(30));
+    // per-command timeout. 500 ms is deliberately generous so cluster slot-map warmup
+    // and MOVED redirects don't cause every command to time out at 30 ms. The parity
+    // point we care about is behavioural: does the client + managedBlock explode
+    // under concurrent blocking future.get()? not: can it match a 30 ms SLA.
+    conn.setTimeout(Duration.ofMillis(500));
     RedisAdvancedClusterAsyncCommands<String, String> cmd = conn.async();
     return new Client() {
       public String get(String k) throws Exception { return cmd.get(k).toCompletableFuture().get(); }
@@ -117,7 +120,7 @@ public class Repro {
      *   - 2,000,000 ns = 2 ms
      *   - 1,000,000,000 / 2,000,000 = 500 requests per second
      **/
-    final long nsPerRequest = 10_000_000L; // 100 req/s
+    final long nsPerRequest = 20_000_000L; // 100 req/s
 
     long next = System.nanoTime();
     while (true) {
