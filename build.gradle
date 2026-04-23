@@ -1,0 +1,15 @@
+plugins { id 'application' }
+java { toolchain { languageVersion = JavaLanguageVersion.of(11) } }
+repositories { mavenCentral() }
+dependencies {
+  implementation "io.valkey:valkey-glide:2.2.9:linux-x86_64"
+  implementation "io.lettuce:lettuce-core:6.5.5.RELEASE"
+}
+application { mainClass = 'repro.Repro' }
+tasks.register('fatJar', Jar) {
+  archiveFileName = 'repro.jar'
+  manifest { attributes 'Main-Class': 'repro.Repro' }
+  duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+  from sourceSets.main.output
+  from { configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) } }
+}

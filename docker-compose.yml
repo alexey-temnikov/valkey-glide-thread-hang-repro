@@ -1,0 +1,26 @@
+services:
+  valkey:
+    image: valkey/valkey:8
+    # single-node "cluster": enable cluster mode and assign all 16384 slots on boot
+    command:
+      - sh
+      - -c
+      - |
+        valkey-server --cluster-enabled yes --cluster-node-timeout 5000 --appendonly no --port 6379 --daemonize yes
+        sleep 1
+        valkey-cli cluster addslots $$(seq 0 16383) >/dev/null
+        tail -f /dev/null
+    ports: ["6379:6379", "16379:16379"]
+
+  app:
+    build: .
+    platform: linux/amd64
+    depends_on: [valkey]
+    command: ["valkey", "6379"]
+    environment:
+      GLIDE_LOG_LEVEL: WARN
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1400m
