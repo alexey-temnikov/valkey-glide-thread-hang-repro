@@ -20,8 +20,7 @@ import io.lettuce.core.cluster.ClusterClientOptions;
 import io.lettuce.core.cluster.ClusterTopologyRefreshOptions;
 import io.lettuce.core.cluster.RedisClusterClient;
 import io.lettuce.core.cluster.api.StatefulRedisClusterConnection;
-import io.lettuce.core.cluster.api.async.RedisAdvancedClusterAsyncCommands;
-
+import io.lettuce.core.cluster.api.sync.RedisAdvancedClusterCommands;
 /** Minimal reproduction of a client-future thread-hang. Two client implementations are
  *  selectable via env var {@code CLIENT}: {@code glide} (default) or {@code lettuce}.
  *  The rest of the harness — ForkJoinPool.managedBlock + future.get() + 500 req/s —
@@ -40,12 +39,6 @@ public class Repro {
     String host = args[0]; int port = Integer.parseInt(args[1]);
     String which = System.getenv().getOrDefault("CLIENT", "glide").toLowerCase();
     System.out.printf("[INIT] client=%s host=%s port=%d%n", which, host, port);
-
-    // Enable Lettuce DEBUG logging when CLIENT=lettuce so we can see command flow
-    if ("lettuce".equals(which)) {
-      System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", "info");
-      System.setProperty("org.slf4j.simpleLogger.log.io.lettuce.core.protocol", "debug");
-    }
 
     Client client = null;
     for (int attempt = 1; attempt <= 30 && client == null; attempt++) {
@@ -69,25 +62,6 @@ public class Repro {
     System.out.println("[INIT] pre-populating 1000 keys...");
     for (int i = 0; i < 1000; i++) c.set("k:" + i, "v");
     System.out.println("[INIT] pre-population complete");
-
-    // SANITY: fire 50 concurrent GETs from plain Threads (no ForkJoinPool), wait for them.
-    // If this hangs, the problem is in the Lettuce client itself (or my use of it),
-    // NOT in managedBlock / ForkJoinPool.
-    System.out.println("[INIT] concurrent sanity: 50 parallel GETs...");
-    java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(50);
-    java.util.concurrent.atomic.AtomicInteger ok = new java.util.concurrent.atomic.AtomicInteger();
-    java.util.concurrent.atomic.AtomicInteger fail = new java.util.concurrent.atomic.AtomicInteger();
-    for (int i = 0; i < 50; i++) {
-      final int kk = i;
-      new Thread(() -> {
-        try { c.get("k:" + kk); ok.incrementAndGet(); }
-        catch (Exception e) { fail.incrementAndGet(); }
-        finally { latch.countDown(); }
-      }, "sanity-" + i).start();
-    }
-    boolean completed = latch.await(15, java.util.concurrent.TimeUnit.SECONDS);
-    System.out.printf("[INIT] sanity result: completed=%s ok=%d fail=%d (remaining=%d)%n",
-        completed, ok.get(), fail.get(), latch.getCount());
 
     AtomicInteger tid = new AtomicInteger();
     ForkJoinPool dispatcher = new ForkJoinPool(50,
@@ -129,19 +103,33 @@ public class Repro {
             .enablePeriodicRefresh(Duration.ofSeconds(60))
             .enableAllAdaptiveRefreshTriggers()
             .build())
-        // apply the URI timeout to every command (not just sync)
         .timeoutOptions(TimeoutOptions.enabled(Duration.ofMillis(500)))
         .build());
-    StatefulRedisClusterConnection<String, String> conn = raw.connect();
-    conn.setReadFrom(io.lettuce.core.ReadFrom.ANY);
     // force a topology refresh so the partition table is populated after the cluster
     // finished assigning slots (addslots is run AFTER valkey-server boot in compose)
-    raw.refreshPartitions();
-    System.out.println("[INIT] Lettuce partitions: " + raw.getPartitions());
-    RedisAdvancedClusterAsyncCommands<String, String> cmd = conn.async();
+    try (StatefulRedisClusterConnection<String, String> boot = raw.connect()) {
+      raw.refreshPartitions();
+      System.out.println("[INIT] Lettuce partitions: " + raw.getPartitions());
+    }
+
+    // Connection pool — Lettuce cluster uses 1 Netty channel per node by default.
+    // Increase parallelism so Lettuce can match GLIDE's internal connection multiplexing
+    // under the shared nsPerRequest pacing.
+    int poolSize = 16;
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    StatefulRedisClusterConnection<String, String>[] conns = new StatefulRedisClusterConnection[poolSize];
+    for (int i = 0; i < poolSize; i++) {
+      conns[i] = raw.connect();
+      conns[i].setReadFrom(io.lettuce.core.ReadFrom.ANY);
+    }
+    System.out.printf("[INIT] Lettuce connection pool size=%d%n", poolSize);
+    java.util.concurrent.atomic.AtomicInteger rr = new java.util.concurrent.atomic.AtomicInteger();
     return new Client() {
-      public String get(String k) throws Exception { return cmd.get(k).toCompletableFuture().get(); }
-      public void set(String k, String v) throws Exception { cmd.set(k, v).toCompletableFuture().get(); }
+      private RedisAdvancedClusterCommands<String, String> pick() {
+        return conns[Math.floorMod(rr.getAndIncrement(), poolSize)].sync();
+      }
+      public String get(String k) { return pick().get(k); }
+      public void set(String k, String v) { pick().set(k, v); }
     };
   }
 
@@ -154,7 +142,7 @@ public class Repro {
      *   - 2,000,000 ns = 2 ms
      *   - 1,000,000,000 / 2,000,000 = 500 requests per second
      **/
-    final long nsPerRequest = 20_000_000L; // 100 req/s
+    final long nsPerRequest = 100_000_000L; // 10 incoming req/s → ~85 GETs/s (avg 8.5 fanout)
 
     long next = System.nanoTime();
     while (true) {

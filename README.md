@@ -54,26 +54,24 @@ pattern.
 
 T+0 to ~15 s: silent warm-up (the app is SETing 1000 keys).
 
-T+15 to ~60 s (steady state):
+At the default rate (~85 GETs/s, fits in 2 CPU / 1.4 GiB cgroup), **both clients** run
+cleanly — this is the baseline for fair comparison:
 
 ```
-[MONITOR] gets=1500(+150/s) errs=0 blocking=40 pool=50 queued=200 threads=80 avg=15.0ms
+[MONITOR] gets=1500(+85/s) errs=0 blocking=0 pool=50 queued=0 threads=58 avg=3.5ms
+[MONITOR] gets=3400(+91/s) errs=0 blocking=0 pool=50 queued=0 threads=58 avg=2.9ms
 ```
 
-T+1–3 min (growth begins):
+To observe the GLIDE thread-hang under memory pressure, raise the rate and the cgroup
+limit together (see the Tuning section below). With enough load and off-heap pressure
+GLIDE's pool grows unbounded and the `[STUCK]` tag fires:
 
 ```
-[MONITOR] gets=12000(+100/s) errs=400 blocking=280 pool=400 queued=180000 threads=440 avg=950.0ms
-[MONITOR] gets=15000(+40/s)  errs=1800 blocking=300 pool=650 queued=500000 threads=700 avg=3000.0ms
+[MONITOR] gets=12000(+100/s) errs=400  blocking=280 pool=400  queued=180000  threads=440  avg=950.0ms
+[STUCK]   gets=52000(+0/s)  errs=12000 blocking=725 pool=1100 queued=2000000 threads=1150 avg=14000.0ms
 ```
 
-T+5 min (stuck):
-
-```
-[STUCK] gets=52000(+0/s) errs=12000 blocking=725 pool=1100 queued=2000000 threads=1150 avg=14000.0ms
-```
-
-With `requestTimeout=30ms` configured, seeing `avg=14 000 ms` means the
+With `requestTimeout=30ms` configured on GLIDE, seeing `avg=14 000 ms` means the
 `CompletableFuture` isn't being completed by the Rust core and Java's `future.get()`
 parks effectively forever. The detector tags `[STUCK]` when 300+ threads are blocked and
 zero GETs completed in the 5-second monitor window.
@@ -95,16 +93,20 @@ zero GETs completed in the 5-second monitor window.
 
 The trigger is the **ratio** of off-heap budget to in-flight command pressure, not the
 absolute size. The defaults (1 GiB heap / 96 MiB MaxDirectMemorySize / 1.4 GiB cgroup
-limit / 500 req/s × avg 8.5 fanout) fit a small Docker VM and reproduce within a few
-minutes.
+limit, 2 CPUs, `nsPerRequest=100_000_000L` → 10 req/s × ~8.5 fanout ≈ 85 GETs/s) fit a
+small Docker VM and give a **healthy baseline on both clients** for comparison.
+
+To observe the GLIDE thread-hang specifically, raise the pressure proportionally — give
+the container more CPUs/RAM and lower `nsPerRequest`.
 
 In `Repro.java`:
 
 | `nsPerRequest` value | Incoming req/s | Outgoing GETs/s | Notes |
 |---|---|---|---|
-| `10_000_000` | 100 | ~850 | warm-up, won't trigger |
-| `2_000_000` (default) | 500 | ~4 250 | triggers in 2–5 min |
-| `1_000_000` | 1 000 | ~8 500 | triggers in <1 min |
+| `100_000_000` (default) | 10 | ~85 | healthy on both clients, fair baseline |
+| `10_000_000` | 100 | ~850 | needs ≥4 CPU; GLIDE begins to drift |
+| `2_000_000` | 500 | ~4 250 | high-load; needs ≥7 CPU + 8 GiB to avoid thread-limit OOM |
+| `1_000_000` | 1 000 | ~8 500 | maximum pressure; thread-hang in <1 min under off-heap squeeze |
 
 In `Dockerfile` / `docker-compose.yml`:
 
